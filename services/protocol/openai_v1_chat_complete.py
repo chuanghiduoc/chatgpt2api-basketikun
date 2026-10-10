@@ -21,6 +21,15 @@ from services.protocol.conversation import (
     stream_text_deltas,
     text_backend,
 )
+from services.protocol.tool_call import (
+    ToolCallStreamState,
+    build_tool_protocol_system_message,
+    normalize_tool_definitions,
+    prepare_tool_messages,
+    to_openai_tool_calls,
+    tool_calling_enabled,
+    try_parse_tool_call,
+)
 from services.protocol.web_search_tool import (
     WEB_SEARCH_TOOL_TYPES,
     has_unsupported_tools,
@@ -175,10 +184,56 @@ def chat_image_args(body: dict[str, Any]) -> tuple[str, str, int, list[tuple[byt
 
 def text_chat_parts(body: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
     model = str(body.get("model") or "auto").strip() or "auto"
-    messages = normalize_text_messages(normalize_messages(chat_messages_from_body(body)))
-    if has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
+    raw_messages = chat_messages_from_body(body)
+    if tool_calling_enabled(body):
+        protocol = build_tool_protocol_system_message(normalize_tool_definitions(body.get("tools")), body.get("tool_choice"))
+        raw_messages = [{"role": "system", "content": protocol}, *prepare_tool_messages(raw_messages)]
+    messages = normalize_text_messages(normalize_messages(raw_messages))
+    if not tool_calling_enabled(body) and has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         messages.insert(0, {"role": "system", "content": TOOL_UNAVAILABLE_SYSTEM_MESSAGE})
     return model, messages
+
+
+def tool_chat_response(backend, messages: list[dict[str, Any]], model: str, thinking_effort: str = "") -> dict[str, Any]:
+    text = collect_text(backend, ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort))
+    response = completion_response(model, text, messages=messages)
+    parsed = try_parse_tool_call(text)
+    if parsed:
+        choice = response["choices"][0]
+        choice["message"] = {"role": "assistant", "content": None, "tool_calls": to_openai_tool_calls(parsed)}
+        choice["finish_reason"] = "tool_calls"
+    return response
+
+
+def stream_tool_chat_completion(
+    backend,
+    messages: list[dict[str, Any]],
+    model: str,
+    thinking_effort: str = "",
+) -> Iterator[dict[str, Any]]:
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+    created = int(time.time())
+    state = ToolCallStreamState()
+    sent_role = False
+    text = ""
+
+    def with_role(delta: dict[str, Any]) -> dict[str, Any]:
+        nonlocal sent_role
+        if sent_role:
+            return delta
+        sent_role = True
+        return {"role": "assistant", **delta}
+
+    request = ConversationRequest(model=model, messages=messages, thinking_effort=thinking_effort)
+    for delta_text in stream_text_deltas(backend, request):
+        text += delta_text
+        for delta in state.feed(text):
+            yield completion_chunk(model, with_role(delta), None, completion_id, created)
+    for delta in state.finish(text):
+        yield completion_chunk(model, with_role(delta), None, completion_id, created)
+    if not sent_role:
+        yield completion_chunk(model, with_role({"content": ""}), None, completion_id, created)
+    yield completion_chunk(model, {}, state.finish_reason(), completion_id, created)
 
 
 def chat_completion_annotations(annotations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -294,6 +349,9 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
             return stream_web_search_chat_completion(messages, model)
         thinking_effort = thinking_effort_from_body(body)
+        # Tool calls are actions: never dedupe or replay them from the completion cache.
+        if tool_calling_enabled(body):
+            return stream_tool_chat_completion(text_backend(model), messages, model, thinking_effort)
         key = cache_key(body, messages, stream=True)
         return chat_completion_cache.get_or_compute_stream(
             key,
@@ -305,6 +363,8 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     if is_web_search_chat_request(body) and not has_unsupported_tools(body, WEB_SEARCH_TOOL_TYPES):
         return web_search_chat_response(messages, model)
     thinking_effort = thinking_effort_from_body(body)
+    if tool_calling_enabled(body):
+        return tool_chat_response(text_backend(model), messages, model, thinking_effort)
     key = cache_key(body, messages, stream=False)
     return chat_completion_cache.get_or_compute_response(
         key,
